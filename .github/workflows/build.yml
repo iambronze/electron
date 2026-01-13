@@ -1,0 +1,75 @@
+name: Build Electron with CET
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  build-electron:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        
+    - name: Install depot_tools
+      run: |
+        git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git C:\depot_tools
+        echo "C:\depot_tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        
+    - name: Configure Windows Defender exclusions
+      run: |
+        # GitHub Actions runners 已经配置好
+        
+    - name: Sync Electron source (cached)
+      run: |
+        gclient sync --no-history
+      # 首次需要 1-2 小时,后续有缓存会快很多
+      
+    - name: Modify build config to enable CET
+      run: |
+        $configPath = "src\electron\build\args\all.gn"
+        $config = Get-Content $configPath
+        $config = $config -replace 'enable_cet_shadow_stack = false', 'enable_cet_shadow_stack = true'
+        $config += "`nv8_enable_cet_shadow_stack = true"
+        $config += "`nis_cfi = true"
+        Set-Content $configPath $config
+        
+    - name: Generate build files
+      run: |
+        cd src
+        gn gen out\CET-Release --args="import(`"//electron/build/args/release.gn`")"
+        
+    - name: Build Electron
+      run: |
+        cd src
+        ninja -C out\CET-Release electron -j 2
+      # GitHub 的 windows-2022 有 2 核 CPU
+      
+    - name: Test Electron
+      run: |
+        cd src
+        out\CET-Release\electron.exe --version
+        
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: electron-cet-build
+        path: src\out\CET-Release\electron.exe
+        retention-days: 30
