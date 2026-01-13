@@ -5,7 +5,7 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch:
 
 jobs:
   build-electron:
@@ -15,8 +15,6 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      with:
-        submodules: recursive
         
     - name: Setup Python
       uses: actions/setup-python@v5
@@ -27,49 +25,176 @@ jobs:
       uses: actions/setup-node@v4
       with:
         node-version: '20'
+    
+    - name: Configure Git
+      run: |
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+        git config --global core.autocrlf false
+        git config --global core.filemode false
+        git config --global core.fscache true
+        git config --global core.preloadindex true
         
     - name: Install depot_tools
       run: |
         git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git C:\depot_tools
         echo "C:\depot_tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        
-    - name: Configure Windows Defender exclusions
+      shell: pwsh
+    
+    - name: Set depot_tools environment
       run: |
-        # GitHub Actions runners 已经配置好
-        
-    - name: Sync Electron source (cached)
+        echo "DEPOT_TOOLS_WIN_TOOLCHAIN=0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        echo "DEPOT_TOOLS_UPDATE=0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      shell: pwsh
+      
+    - name: Create workspace directory
       run: |
-        gclient sync --no-history
-      # 首次需要 1-2 小时,后续有缓存会快很多
+        New-Item -ItemType Directory -Force -Path D:\electron-build
+        Set-Location D:\electron-build
+      shell: pwsh
+      
+    - name: Configure gclient
+      run: |
+        cd D:\electron-build
+        
+        # 创建 .gclient 配置文件
+        @"
+        solutions = [
+          {
+            "name": "src/electron",
+            "url": "https://github.com/electron/electron.git",
+            "deps_file": "DEPS",
+            "managed": False,
+            "custom_deps": {
+              "src": None,
+            },
+            "custom_vars": {},
+          },
+        ]
+        "@ | Out-File -FilePath .gclient -Encoding utf8
+      shell: pwsh
+      
+    - name: Sync Electron source (this will take 1-2 hours first time)
+      run: |
+        cd D:\electron-build
+        gclient sync --no-history --nohooks
+      shell: pwsh
+      timeout-minutes: 180
+      
+    - name: Run hooks
+      run: |
+        cd D:\electron-build
+        gclient runhooks
+      shell: pwsh
+      timeout-minutes: 60
       
     - name: Modify build config to enable CET
       run: |
+        cd D:\electron-build
         $configPath = "src\electron\build\args\all.gn"
-        $config = Get-Content $configPath
-        $config = $config -replace 'enable_cet_shadow_stack = false', 'enable_cet_shadow_stack = true'
-        $config += "`nv8_enable_cet_shadow_stack = true"
-        $config += "`nis_cfi = true"
-        Set-Content $configPath $config
         
+        # 读取配置文件
+        $config = Get-Content $configPath -Raw
+        
+        # 修改 enable_cet_shadow_stack
+        $config = $config -replace 'enable_cet_shadow_stack = false', 'enable_cet_shadow_stack = true'
+        
+        # 修改 is_cfi (如果你想启用 CFI)
+        # 注意: CFI 可能导致编译问题,建议先只测试 CET
+        # $config = $config -replace 'is_cfi = false', 'is_cfi = true'
+        
+        # 添加 v8_enable_cet_shadow_stack (如果文件中没有)
+        if ($config -notmatch 'v8_enable_cet_shadow_stack') {
+            $config += "`nv8_enable_cet_shadow_stack = true`n"
+        }
+        
+        # 保存修改
+        Set-Content $configPath $config -NoNewline
+        
+        # 显示修改内容
+        Write-Host "Modified config:"
+        Get-Content $configPath | Select-String -Pattern "cet|cfi"
+      shell: pwsh
+      
     - name: Generate build files
       run: |
-        cd src
-        gn gen out\CET-Release --args="import(`"//electron/build/args/release.gn`")"
+        cd D:\electron-build\src
         
+        # 使用 testing 配置 (编译更快)
+        gn gen out\CET-Testing --args="import(\`"//electron/build/args/testing.gn\`")"
+        
+        # 或使用 release 配置 (更慢但性能更好)
+        # gn gen out\CET-Release --args="import(\`"//electron/build/args/release.gn\`")"
+      shell: pwsh
+      
+    - name: Verify CET is enabled in build config
+      run: |
+        cd D:\electron-build\src
+        
+        Write-Host "Checking CET configuration:"
+        gn args out\CET-Testing --list --short | Select-String -Pattern "cet"
+        
+        Write-Host "`nChecking CFI configuration:"
+        gn args out\CET-Testing --list --short | Select-String -Pattern "cfi"
+      shell: pwsh
+      
     - name: Build Electron
       run: |
-        cd src
-        ninja -C out\CET-Release electron -j 2
-      # GitHub 的 windows-2022 有 2 核 CPU
+        cd D:\electron-build\src
+        
+        # GitHub Actions Windows runner 有 2 核 CPU
+        # 使用 -j 2 限制并行任务,避免内存不足
+        ninja -C out\CET-Testing electron -j 2
+      shell: pwsh
+      timeout-minutes: 180
       
     - name: Test Electron
       run: |
-        cd src
-        out\CET-Release\electron.exe --version
+        cd D:\electron-build\src
         
-    - name: Upload artifacts
+        # 测试是否能正常启动
+        out\CET-Testing\electron.exe --version
+        
+        # 运行简单的 JavaScript 测试
+        $testScript = @"
+        const { app } = require('electron');
+        console.log('Electron version:', process.versions.electron);
+        console.log('Node version:', process.versions.node);
+        console.log('V8 version:', process.versions.v8);
+        app.quit();
+        "@
+        
+        $testScript | Out-File -FilePath test.js -Encoding utf8
+        out\CET-Testing\electron.exe test.js
+      shell: pwsh
+      
+    - name: Package build artifacts
+      run: |
+        cd D:\electron-build\src
+        
+        # 创建分发包目录
+        New-Item -ItemType Directory -Force -Path out\CET-Testing\dist
+        
+        # 复制必要的文件
+        Copy-Item out\CET-Testing\electron.exe out\CET-Testing\dist\
+        Copy-Item out\CET-Testing\*.dll out\CET-Testing\dist\ -ErrorAction SilentlyContinue
+        Copy-Item out\CET-Testing\*.pak out\CET-Testing\dist\ -ErrorAction SilentlyContinue
+        Copy-Item out\CET-Testing\locales out\CET-Testing\dist\ -Recurse -ErrorAction SilentlyContinue
+      shell: pwsh
+      
+    - name: Upload Electron build
       uses: actions/upload-artifact@v4
       with:
-        name: electron-cet-build
-        path: src\out\CET-Release\electron.exe
+        name: electron-cet-build-windows
+        path: D:\electron-build\src\out\CET-Testing\dist
         retention-days: 30
+        
+    - name: Upload build logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs
+        path: |
+          D:\electron-build\src\out\CET-Testing\*.log
+          D:\electron-build\src\out\CET-Testing\build.ninja
+        retention-days: 7
